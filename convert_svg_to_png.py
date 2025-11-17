@@ -88,15 +88,28 @@ def preprocess_svg_for_template(svg_path: Path) -> Path:
     # Extract the entire Symbols group
     symbols_group = svg_content[symbols_start:symbols_end]
     
-    # Replace all path elements to ensure they have fill="black"
-    # Only add fill="black" to paths that don't already have a fill attribute
-    def add_fill(match):
+    # Replace fill="none" with fill="black" and add stroke="black" for stroked paths
+    # Also ensure all paths have fill="black"
+    def fix_path_fill(match):
         path_tag = match.group(0)
+        
+        # Replace fill="none" with fill="black"
+        path_tag = re.sub(r'fill="none"', 'fill="black"', path_tag)
+        
+        # If path has a stroke but no fill, or fill is still missing, ensure it has fill="black"
         if 'fill=' not in path_tag:
-            return path_tag.replace('<path ', '<path fill="black" ')
+            path_tag = path_tag.replace('<path ', '<path fill="black" ')
+        
+        # For stroked paths, also add fill to make them visible
+        if 'stroke=' in path_tag and 'fill="black"' not in path_tag:
+            # If we just replaced fill="none" it will already have fill="black"
+            # but if not, add it
+            if 'fill=' not in path_tag:
+                path_tag = path_tag.replace('<path ', '<path fill="black" ')
+        
         return path_tag
     
-    symbols_group = re.sub(r'<path\s+[^>]*>', add_fill, symbols_group)
+    symbols_group = re.sub(r'<path\s+[^>]*>', fix_path_fill, symbols_group)
     
     # Create a new SVG with just the symbols group
     # Use the standard viewBox from Apple SF Symbol templates
@@ -116,7 +129,7 @@ def preprocess_svg_for_template(svg_path: Path) -> Path:
 
 def convert_svg_to_png(svg_path: Path, png_path: Path, size: int = 96) -> bool:
     """
-    Convert an SVG file to a PNG file using Inkscape.
+    Convert an SVG file to a PNG file using Inkscape, preserving aspect ratio.
     
     Args:
         svg_path: Path to the input SVG file
@@ -127,6 +140,7 @@ def convert_svg_to_png(svg_path: Path, png_path: Path, size: int = 96) -> bool:
         True if conversion was successful, False otherwise
     """
     temp_svg = None
+    temp_png = None
     try:
         # Preprocess the SVG to extract just the symbol content
         temp_svg = preprocess_svg_for_template(svg_path)
@@ -139,26 +153,51 @@ def convert_svg_to_png(svg_path: Path, png_path: Path, size: int = 96) -> bool:
         if png_path.exists():
             png_path.unlink()
         
+        # Create a temporary PNG path for the initial export
+        temp_png = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+        temp_png.close()
+        temp_png_path = Path(temp_png.name)
+        
         # Try different symbol IDs - some symbols use Regular-M, others use Regular-S
         symbol_ids = ['Regular-M', 'Regular-S', 'Regular-L']
         
         for symbol_id in symbol_ids:
             # Use Inkscape to export just the specified symbol
+            # Use --export-width only to preserve aspect ratio
             cmd = [
                 'inkscape',
                 str(temp_svg_abs),
                 f'--export-id={symbol_id}',
                 '--export-id-only',
                 f'--export-width={size}',
-                f'--export-height={size}',
                 '--export-type=png',
-                f'--export-filename={str(png_path_abs)}'
+                f'--export-filename={str(temp_png_path.resolve())}'
             ]
             
             result = subprocess.run(cmd, capture_output=True, text=True)
             
             # Check if the export succeeded by verifying the file was created
-            if result.returncode == 0 and png_path.exists() and png_path.stat().st_size > 0:
+            if result.returncode == 0 and temp_png_path.exists() and temp_png_path.stat().st_size > 0:
+                # Now pad/center the image to make it exactly size x size
+                from PIL import Image
+                img = Image.open(temp_png_path)
+                
+                # Create a new transparent image of the target size
+                final_img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+                
+                # Calculate position to center the image
+                x_offset = (size - img.width) // 2
+                y_offset = (size - img.height) // 2
+                
+                # Paste the image centered
+                final_img.paste(img, (x_offset, y_offset), img if img.mode == 'RGBA' else None)
+                
+                # Save the final image
+                final_img.save(png_path_abs, 'PNG')
+                
+                # Clean up temp PNG
+                temp_png_path.unlink()
+                
                 return True
         
         # None of the symbol IDs worked
@@ -169,9 +208,11 @@ def convert_svg_to_png(svg_path: Path, png_path: Path, size: int = 96) -> bool:
         print(f"Exception converting {svg_path.name}: {e}")
         return False
     finally:
-        # Clean up temporary file
+        # Clean up temporary files
         if temp_svg and temp_svg != svg_path and temp_svg.exists():
             temp_svg.unlink()
+        if temp_png and Path(temp_png.name).exists():
+            Path(temp_png.name).unlink()
 
 
 def verify_png(png_path: Path) -> Tuple[bool, str]:
@@ -222,12 +263,6 @@ def main():
     project_root = Path(__file__).parent
     resources_dir = project_root / 'Sources' / 'SVGAssetConverter' / 'Resources' / 'Media.xcassets' / 'Icons4EmbeddedWidgets'
     output_dir = project_root / 'VALUEADD'
-    
-    # Check if rsvg-convert is available
-    if not check_rsvg_convert():
-        print("Error: rsvg-convert is not installed.")
-        print("Install it with: sudo apt-get install librsvg2-bin")
-        sys.exit(1)
     
     # Create output directory if it doesn't exist
     output_dir.mkdir(parents=True, exist_ok=True)
