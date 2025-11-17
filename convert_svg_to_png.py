@@ -162,43 +162,81 @@ def convert_svg_to_png(svg_path: Path, png_path: Path, size: int = 96) -> bool:
         symbol_ids = ['Regular-M', 'Regular-S', 'Regular-L']
         
         for symbol_id in symbol_ids:
-            # Use Inkscape to export just the specified symbol
-            # Use --export-width only to preserve aspect ratio
-            cmd = [
+            # First, export to get the natural size to determine aspect ratio
+            # Export at a large size to maintain quality
+            test_size = 200
+            cmd_test = [
                 'inkscape',
                 str(temp_svg_abs),
                 f'--export-id={symbol_id}',
                 '--export-id-only',
-                f'--export-width={size}',
+                f'--export-width={test_size}',
                 '--export-type=png',
                 f'--export-filename={str(temp_png_path.resolve())}'
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd_test, capture_output=True, text=True)
             
-            # Check if the export succeeded by verifying the file was created
             if result.returncode == 0 and temp_png_path.exists() and temp_png_path.stat().st_size > 0:
-                # Now pad/center the image to make it exactly size x size
+                # Load the test image to check dimensions
                 from PIL import Image
-                img = Image.open(temp_png_path)
+                test_img = Image.open(temp_png_path)
+                aspect_ratio = test_img.width / test_img.height
                 
-                # Create a new transparent image of the target size
-                final_img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+                # Export at a size that leaves some padding (use 90% of target size)
+                # This ensures symbols don't touch the edges
+                export_size = int(size * 0.92)  # Leave ~4px padding on each side
                 
-                # Calculate position to center the image
-                x_offset = (size - img.width) // 2
-                y_offset = (size - img.height) // 2
+                # Now export at the correct size to fit within the target canvas
+                # If width > height (landscape), use --export-width
+                # If height > width (portrait), use --export-height
+                # This ensures the image fits within size x size without being cropped
+                if aspect_ratio >= 1.0:
+                    # Landscape or square - constrain by width
+                    cmd = [
+                        'inkscape',
+                        str(temp_svg_abs),
+                        f'--export-id={symbol_id}',
+                        '--export-id-only',
+                        f'--export-width={export_size}',
+                        '--export-type=png',
+                        f'--export-filename={str(temp_png_path.resolve())}'
+                    ]
+                else:
+                    # Portrait - constrain by height to avoid cropping
+                    cmd = [
+                        'inkscape',
+                        str(temp_svg_abs),
+                        f'--export-id={symbol_id}',
+                        '--export-id-only',
+                        f'--export-height={export_size}',
+                        '--export-type=png',
+                        f'--export-filename={str(temp_png_path.resolve())}'
+                    ]
                 
-                # Paste the image centered
-                final_img.paste(img, (x_offset, y_offset), img if img.mode == 'RGBA' else None)
+                result = subprocess.run(cmd, capture_output=True, text=True)
                 
-                # Save the final image
-                final_img.save(png_path_abs, 'PNG')
-                
-                # Clean up temp PNG
-                temp_png_path.unlink()
-                
-                return True
+                if result.returncode == 0 and temp_png_path.exists():
+                    # Now pad/center the image to make it exactly size x size
+                    img = Image.open(temp_png_path)
+                    
+                    # Create a new transparent image of the target size
+                    final_img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+                    
+                    # Calculate position to center the image
+                    x_offset = (size - img.width) // 2
+                    y_offset = (size - img.height) // 2
+                    
+                    # Paste the image centered
+                    final_img.paste(img, (x_offset, y_offset), img if img.mode == 'RGBA' else None)
+                    
+                    # Save the final image
+                    final_img.save(png_path_abs, 'PNG')
+                    
+                    # Clean up temp PNG
+                    temp_png_path.unlink()
+                    
+                    return True
         
         # None of the symbol IDs worked
         print(f"Error converting {svg_path.name}: No valid symbol ID found")
