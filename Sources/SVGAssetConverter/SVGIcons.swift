@@ -8,8 +8,11 @@ import SwiftUI
 
 #if canImport(UIKit)
   import UIKit
+  typealias PlatformImage = UIImage
 #elseif canImport(AppKit)
   import AppKit
+  import QuickLookThumbnailing
+  typealias PlatformImage = NSImage
 #endif
 
 // MARK: - SendableImagePtr
@@ -47,6 +50,10 @@ public enum SVGIconAsset: String, CaseIterable, Identifiable, Sendable {
   case zzzBounty = "icon.zzzBounty"
   case zzzInvestigation = "icon.zzzInvestigation"
 
+  @MainActor private static var svgURLCache: [SVGIconAsset: URL] = [:]
+  @MainActor private static var cleanedSVGCache: [SVGIconAsset: Data] = [:]
+  @MainActor private static var cleanedFileCache: [SVGIconAsset: URL] = [:]
+
   // MARK: Public
 
   public var id: String { rawValue }
@@ -69,6 +76,58 @@ public enum SVGIconAsset: String, CaseIterable, Identifiable, Sendable {
     case .zzzBounty: .scope
     case .zzzInvestigation: .magnifyingglass
     }
+  }
+
+  @MainActor
+  func svgDocumentURL() -> URL? {
+    if let cached = Self.svgURLCache[self] { return cached }
+    guard let baseURL = Bundle.module.resourceURL?
+      .appendingPathComponent("Media.xcassets", isDirectory: true)
+      .appendingPathComponent("Icons4EmbeddedWidgets", isDirectory: true)
+      .appendingPathComponent("\(rawValue).symbolset", isDirectory: true)
+    else {
+      return nil
+    }
+    let contentsURL = baseURL.appendingPathComponent("Contents.json", isDirectory: false)
+    guard let data = try? Data(contentsOf: contentsURL),
+      let contents = try? JSONDecoder().decode(SymbolSetContents.self, from: data),
+      let filename = contents.symbols.first?.filename
+    else {
+      return nil
+    }
+    let svgURL = baseURL.appendingPathComponent(filename, isDirectory: false)
+    Self.svgURLCache[self] = svgURL
+    return svgURL
+  }
+
+  @MainActor
+  func cleanedSymbolDocumentURL(fileManager: FileManager = .default) -> URL? {
+    if let cached = Self.cleanedFileCache[self], fileManager.fileExists(atPath: cached.path) {
+      return cached
+    }
+    guard let data = cleanedSymbolDocumentData() else { return nil }
+    let directory = fileManager.temporaryDirectory.appendingPathComponent("SVGAssetConverter", isDirectory: true)
+    do {
+      try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+      let fileURL = directory.appendingPathComponent("\(rawValue).svg")
+      try data.write(to: fileURL, options: .atomic)
+      Self.cleanedFileCache[self] = fileURL
+      return fileURL
+    } catch {
+      return nil
+    }
+  }
+
+  @MainActor
+  private func cleanedSymbolDocumentData() -> Data? {
+    if let cached = Self.cleanedSVGCache[self] { return cached }
+    guard let sourceURL = svgDocumentURL(), let rawData = try? Data(contentsOf: sourceURL),
+      let cleaned = try? Self.extractSymbolsDocument(from: rawData)
+    else {
+      return nil
+    }
+    Self.cleanedSVGCache[self] = cleaned
+    return cleaned
   }
 
   @MainActor
@@ -105,10 +164,54 @@ public enum SVGIconAsset: String, CaseIterable, Identifiable, Sendable {
     if SVGIconImageCache.shared.hasImage(for: self) {
       return
     }
-    Task.detached(priority: .utility) {
-      await SVGIconsCompiler.shared.precompile(icon: self)
-    }
+    SVGIconsCompiler.shared.precompile(icon: self)
   }
+}
+
+// MARK: - Symbol Metadata
+
+private struct SymbolSetContents: Decodable {
+  struct SymbolRecord: Decodable {
+    let filename: String
+  }
+
+  let symbols: [SymbolRecord]
+}
+
+extension SVGIconAsset {
+  private static func extractSymbolsDocument(from data: Data) throws -> Data {
+    let document = try XMLDocument(data: data, options: [.nodePreserveWhitespace])
+    guard let root = document.rootElement() else {
+      throw SVGSymbolExtractionError.missingRoot
+    }
+    guard let symbolsNode = root.elements(forName: "g").first(where: { $0.attribute(forName: "id")?.stringValue == "Symbols" }) else {
+      throw SVGSymbolExtractionError.missingSymbolGroup
+    }
+    let newRoot = XMLElement(name: root.name ?? "svg")
+    if let attributes = root.attributes {
+      for attribute in attributes {
+        newRoot.addAttribute(attribute.copy() as! XMLNode)
+      }
+    }
+    if let children = root.children {
+      for child in children {
+        guard let element = child as? XMLElement else { continue }
+        if element.name == "style" || element.name == "defs" {
+          newRoot.addChild(element.copy() as! XMLElement)
+        }
+      }
+    }
+    newRoot.addChild(symbolsNode.copy() as! XMLElement)
+    let cleanedDocument = XMLDocument(rootElement: newRoot)
+    cleanedDocument.characterEncoding = "utf-8"
+    cleanedDocument.isStandalone = true
+    return cleanedDocument.xmlData(options: [.nodeCompactEmptyElement])
+  }
+}
+
+enum SVGSymbolExtractionError: Error {
+  case missingRoot
+  case missingSymbolGroup
 }
 
 // MARK: - SVGIconImageCache
@@ -144,86 +247,69 @@ final class SVGIconImageCache {
 // MARK: - SVGIconsCompiler
 
 @available(iOS 16.2, macCatalyst 16.2, *)
-public actor SVGIconsCompiler {
+@MainActor
+public final class SVGIconsCompiler {
   // MARK: Public
 
   public static let shared = SVGIconsCompiler()
 
-  public func precompileAllIfNeeded() async {
+  public func precompileAllIfNeeded() {
     // 這些任務得逐一完成。
     for icon in SVGIconAsset.allCases {
-      await precompile(icon: icon)
+      precompile(icon: icon)
     }
   }
 
-  public func precompile(icon: SVGIconAsset) async {
-    _ = await Task { @MainActor in
-      let cache = SVGIconImageCache.shared
-      if cache.hasImage(for: icon) {
-        return
-      }
-      guard let rendered = Self.renderImage(for: icon) else {
-        return
-      }
-      await MainActor.run {
-        cache.store(rendered, for: icon)
-      }
+  public func precompile(icon: SVGIconAsset) {
+    let cache = SVGIconImageCache.shared
+    if cache.hasImage(for: icon) {
+      return
     }
-    .value
+    guard let rendered = Self.renderImage(for: icon) else {
+      return
+    }
+    cache.store(rendered, for: icon)
   }
 
   // MARK: Private
 
   @MainActor
   private static func renderImage(for icon: SVGIconAsset) -> SendableImagePtr? {
-    let content = Image(icon.rawValue, bundle: .module)
-      .renderingMode(.template)
-      .resizable()
-      .aspectRatio(contentMode: .fit)
-    let renderer = ImageRenderer(content: content)
-    renderer.scale = 1
-    renderer.isOpaque = false
-    renderer.proposedSize = ProposedViewSize(width: 96, height: 96)
+    guard let platformImage = renderPlatformImage(for: icon) else {
+      return nil
+    }
     #if canImport(UIKit)
-      guard let platformImage = renderer.uiImage else { return nil }
       let templated = Image(uiImage: platformImage).renderingMode(.template)
     #elseif canImport(AppKit)
-      guard let platformImage = renderer.nsImage else { return nil }
       let templated = Image(nsImage: platformImage).renderingMode(.template)
     #else
       return nil
     #endif
     return SendableImagePtr(img: templated)
   }
+
+  @MainActor
+  static func renderPlatformImage(for icon: SVGIconAsset) -> PlatformImage? {
+    SVGSymbolRenderer.platformImage(for: icon)
+  }
 }
 
 // MARK: - SVGIconPrewarmCoordinator
 
 @available(iOS 16.2, macCatalyst 16.2, *)
-public actor SVGIconPrewarmCoordinator {
+@MainActor
+public final class SVGIconPrewarmCoordinator {
   // MARK: Public
 
   public static let shared = SVGIconPrewarmCoordinator()
 
-  public func ensurePrecompiled() async {
-    if hasCompletedPrewarm {
-      return
-    }
-    if let task = inFlightTask {
-      await task.value
-      return
-    }
-    let task = Task(priority: .userInitiated) {
-      await SVGIconsCompiler.shared.precompileAllIfNeeded()
-    }
-    inFlightTask = task
-    await task.value
+  public func ensurePrecompiled() {
+    guard hasCompletedPrewarm == false else { return }
+    SVGIconsCompiler.shared.precompileAllIfNeeded()
     hasCompletedPrewarm = true
-    inFlightTask = nil
   }
 
   // MARK: Private
 
-  private var inFlightTask: Task<(), Never>?
   private var hasCompletedPrewarm = false
 }
